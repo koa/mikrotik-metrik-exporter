@@ -116,6 +116,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .build()?;
 
+    info!("Loaded config: {:#?}", cfg);
+
+
     let port = cfg.get("port").ok().unwrap_or(8080);
     let address = SocketAddr::new(IpAddr::from([0; 8]), port);
     let listener = TcpListener::bind(address)

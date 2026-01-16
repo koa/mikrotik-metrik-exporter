@@ -107,8 +107,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::builder()
-        .add_source(File::with_name("config.yaml"))
-        .add_source(File::with_name("/config/config.yaml"))
+        .add_source(File::with_name("config.yaml").required(false))
+        .add_source(File::with_name("/config/config.yaml").required(false))
         .add_source(
             Environment::with_prefix("APP")
                 .separator("-")

@@ -1,27 +1,30 @@
+use axum::{http::StatusCode, routing::get, Router};
 use config::{Config, Environment, File};
 use encoding_rs::mem::decode_latin1;
 use env_logger::{Env, TimestampPrecision};
 use log::{debug, error, info, warn};
 use mikrotik_api::prelude::TrapCategory;
-use mikrotik_model::model::IpDhcpServerLease;
 use mikrotik_model::{
-    MacAddress, MikrotikDevice,
-    ascii::AsciiString,
+    ascii::AsciiString, model::IpDhcpServerLease,
     model::{
         CapsManInterfaceById, CapsManInterfaceState, CapsManRadioState,
         CapsManRegistrationTableState, InterfaceEthernet, InterfaceEthernetPoeMonitorState,
         InterfaceWifiByName, InterfaceWifiRadioState, InterfaceWifiRegistrationTableState,
         InterfaceWifiState, ResourceType, SystemHealthState, SystemHealthType, SystemIdentityCfg,
     },
-    resource::{DeserializeRosResource, SentenceResult, SingleResource, stream_resource},
+    resource::{stream_resource, DeserializeRosResource, SentenceResult, SingleResource},
     value::{RosValue, StatsPair},
+    MacAddress,
+    MikrotikDevice,
 };
 use prometheus::{
-    Encoder, TextEncoder,
-    proto::{Counter, LabelPair, Metric, MetricFamily},
+    proto::{Counter, LabelPair, Metric, MetricFamily}, Encoder,
+    TextEncoder,
 };
 use serde::Deserialize;
-use std::{borrow::Cow, collections::HashMap, io::stdout, net::IpAddr, time::Duration};
+use std::net::SocketAddr;
+use std::{borrow::Cow, collections::HashMap, net::IpAddr, process, time::Duration};
+use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +115,48 @@ async fn main() -> anyhow::Result<()> {
         )
         .build()?;
 
+    let port = cfg.get("port").ok().unwrap_or(8080);
+    let address = SocketAddr::new(IpAddr::from([0; 8]), port);
+    let listener = TcpListener::bind(address)
+        .await
+        .expect("Cannot bind socket");
+
+    let app = Router::new()
+        .route(
+            "/metrics",
+            get(async move || match metrics(cfg.clone()).await {
+                Ok(metrics) => (StatusCode::OK, metrics),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{:?}", e).into_bytes(),
+                ),
+            }),
+        )
+        .route("/health", get(health));
+
+    info!("Starting server on {}", address);
+    match axum::serve(listener, app.into_make_service()).await {
+        Ok(_) => {}
+        Err(e) => {
+            error!("Cannot start server: {}", e);
+            process::exit(1);
+        }
+    }
+    Ok(())
+}
+async fn metrics(cfg: Config) -> anyhow::Result<Vec<u8>> {
+    // Gather the metrics.
+    let mut buffer = vec![];
+    let encoder = TextEncoder::new();
+    let metric_families = collect_metrics(cfg).await?.collect();
+    encoder.encode(&metric_families, &mut buffer)?;
+    Ok(buffer)
+}
+async fn health() -> &'static str {
+    "OK\n"
+}
+
+async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
     let devices: Vec<Device> = cfg.get("devices")?;
     let mut metrics_collection = MetricsCollection::default();
     let mut connected_devices = Vec::with_capacity(devices.len());
@@ -139,11 +184,7 @@ async fn main() -> anyhow::Result<()> {
         collect_health_metric(&mut metrics_collection, &device, identity).await;
         collect_ethernet_metric(&mut metrics_collection, &device, identity).await;
     }
-
-    let encoder = TextEncoder::new();
-    let families = metrics_collection.collect();
-    encoder.encode(&families, &mut stdout())?;
-    Ok(())
+    Ok(metrics_collection)
 }
 
 async fn collect_ip_leases(ip_leases: &mut HashMap<MacAddress, IpLease>, device: &MikrotikDevice) {

@@ -1,0 +1,7 @@
+/target
+/config.yaml
+/.idea/.gitignore
+/.idea/mikrotik-metric-exporter.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/vcs.xml

@@ -1,25 +1,25 @@
-use axum::{http::StatusCode, routing::get, Router};
+use axum::{Router, http::StatusCode, routing::get};
 use config::{Config, Environment, File};
 use encoding_rs::mem::decode_latin1;
 use env_logger::{Env, TimestampPrecision};
 use log::{debug, error, info, warn};
 use mikrotik_api::prelude::TrapCategory;
 use mikrotik_model::{
-    ascii::AsciiString, model::IpDhcpServerLease,
+    MacAddress, MikrotikDevice,
+    ascii::AsciiString,
+    model::IpDhcpServerLease,
     model::{
         CapsManInterfaceById, CapsManInterfaceState, CapsManRadioState,
         CapsManRegistrationTableState, InterfaceEthernet, InterfaceEthernetPoeMonitorState,
         InterfaceWifiByName, InterfaceWifiRadioState, InterfaceWifiRegistrationTableState,
         InterfaceWifiState, ResourceType, SystemHealthState, SystemHealthType, SystemIdentityCfg,
     },
-    resource::{stream_resource, DeserializeRosResource, SentenceResult, SingleResource},
+    resource::{DeserializeRosResource, SentenceResult, SingleResource, stream_resource},
     value::{RosValue, StatsPair},
-    MacAddress,
-    MikrotikDevice,
 };
 use prometheus::{
-    proto::{Counter, LabelPair, Metric, MetricFamily}, Encoder,
-    TextEncoder,
+    Encoder, TextEncoder,
+    proto::{Counter, LabelPair, Metric, MetricFamily},
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
@@ -108,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::builder()
         .add_source(File::with_name("config.yaml"))
+        .add_source(File::with_name("/config/config.yaml"))
         .add_source(
             Environment::with_prefix("APP")
                 .separator("-")
@@ -126,10 +127,13 @@ async fn main() -> anyhow::Result<()> {
             "/metrics",
             get(async move || match metrics(cfg.clone()).await {
                 Ok(metrics) => (StatusCode::OK, metrics),
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{:?}", e).into_bytes(),
-                ),
+                Err(e) => {
+                    error!("Error collecting metrics: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("{:?}", e).into_bytes(),
+                    )
+                }
             }),
         )
         .route("/health", get(health));

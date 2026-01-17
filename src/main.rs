@@ -7,12 +7,11 @@ use mikrotik_api::prelude::TrapCategory;
 use mikrotik_model::{
     MacAddress, MikrotikDevice,
     ascii::AsciiString,
-    model::IpDhcpServerLease,
     model::{
         CapsManInterfaceById, CapsManInterfaceState, CapsManRadioState,
         CapsManRegistrationTableState, InterfaceEthernet, InterfaceEthernetPoeMonitorState,
         InterfaceWifiByName, InterfaceWifiRadioState, InterfaceWifiRegistrationTableState,
-        InterfaceWifiState, ResourceType, SystemHealthState, SystemHealthType, SystemIdentityCfg,
+        InterfaceWifiState, IpDhcpServerLease, ResourceType, SystemHealthState, SystemIdentityCfg,
     },
     resource::{DeserializeRosResource, SentenceResult, SingleResource, stream_resource},
     value::{RosValue, StatsPair},
@@ -22,12 +21,18 @@ use prometheus::{
     proto::{Counter, LabelPair, Metric, MetricFamily},
 };
 use serde::Deserialize;
-use std::net::SocketAddr;
-use std::{borrow::Cow, collections::HashMap, net::IpAddr, process, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    process,
+    time::Duration,
+};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Device {
     #[allow(dead_code)]
     name: Box<str>,
@@ -107,8 +112,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cfg = Config::builder()
-        .add_source(File::with_name("config.yaml").required(false))
-        .add_source(File::with_name("/config/config.yaml").required(false))
+        .add_source(File::with_name("config.yaml"))
         .add_source(
             Environment::with_prefix("APP")
                 .separator("-")
@@ -116,8 +120,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .build()?;
 
-    info!("Loaded config: {:#?}", cfg);
-
+    info!("Loaded config: {:?}", cfg);
+    let devs = cfg.get_array("devices").expect("No devices configured");
+    info!("Devices: {:?}", devs);
+    for x in devs {
+        let map = x.into_table().expect("Device is not a table");
+        let address = map.get("address").expect("No address configured");
+        info!("Device address: {}", address);
+        let user = map.get("user").expect("No user configured");
+        info!("Device user: {}", user);
+    }
 
     let port = cfg.get("port").ok().unwrap_or(8080);
     let address = SocketAddr::new(IpAddr::from([0; 8]), port);
@@ -141,11 +153,24 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/health", get(health));
 
-    info!("Starting server on {}", address);
-    match axum::serve(listener, app.into_make_service()).await {
-        Ok(_) => {}
+    tokio::spawn(async move {
+        info!("Starting server on {}", address);
+        match axum::serve(listener, app.into_make_service()).await {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Cannot start server: {}", e);
+                process::exit(1);
+            }
+        }
+    });
+
+    info!("Waiting for ctrl-c...");
+    match tokio::signal::ctrl_c().await {
+        Ok(_) => {
+            info!("Received ctrl-c, exiting");
+        }
         Err(e) => {
-            error!("Cannot start server: {}", e);
+            error!("Cannot listen for ctrl-c: {}", e);
             process::exit(1);
         }
     }
@@ -164,17 +189,45 @@ async fn health() -> &'static str {
 }
 
 async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
-    let devices: Vec<Device> = cfg.get("devices")?;
+    info!("Starting metrics collection");
+    info!("cfg: {:?}", cfg);
+    //let devices: Vec<Device> = cfg.get("devices")?;
+    let devs = cfg.get_array("devices").expect("No devices configured");
+
+    //info!("Devices: {:?}", devices);
     let mut metrics_collection = MetricsCollection::default();
-    let mut connected_devices = Vec::with_capacity(devices.len());
-    for device_cfg in devices.iter() {
-        let device: MikrotikDevice = MikrotikDevice::connect(
-            (device_cfg.address, 8728),
-            device_cfg.user.as_bytes(),
-            Some(device_cfg.password.as_bytes()),
+    let mut connected_devices = Vec::with_capacity(devs.len());
+    for device_cfg in devs {
+        let mut device_table = device_cfg.into_table().expect("Device is not a table");
+        let address = device_table
+            .remove("address")
+            .expect("No address configured")
+            .into_string()
+            .expect("Address is not a string");
+        let user = device_table
+            .remove("user")
+            .expect("No user configured")
+            .into_string()
+            .expect("User is not a string");
+        let password = device_table
+            .remove("password")
+            .expect("No password configured")
+            .into_string()
+            .expect("Password is not a string");
+        match MikrotikDevice::connect(
+            (address.clone(), 8728),
+            user.as_bytes(),
+            Some(password.as_bytes()),
         )
-        .await?;
-        connected_devices.push(device);
+        .await
+        {
+            Ok(device) => {
+                connected_devices.push(device);
+            }
+            Err(error) => {
+                error!("Cannot connect to device: {address}, {error}");
+            }
+        }
     }
 
     let mut ip_leases = HashMap::<MacAddress, IpLease>::new();
@@ -295,36 +348,38 @@ async fn collect_health_metric(
             create_label_pair("hostname", identity.to_string()),
             create_label_pair("name", value.name.to_string()),
         ];
-        match value._type {
-            SystemHealthType::W => {
-                metrics_collection
-                    .health_power
-                    .metric
-                    .push(create_metric_value(&labels, value.value));
+        match (
+            value._type.0.as_ref(),
+            value.value.to_string().parse::<f64>(),
+        ) {
+            (b"W", Ok(value)) => metrics_collection
+                .health_power
+                .metric
+                .push(create_metric_value(&labels, value)),
+            (b"C", Ok(value)) => metrics_collection
+                .health_temperature
+                .metric
+                .push(create_metric_value(&labels, value)),
+            (b"V", Ok(value)) => metrics_collection
+                .health_voltage
+                .metric
+                .push(create_metric_value(&labels, value)),
+            (b"RPM", Ok(value)) => metrics_collection
+                .health_rpm
+                .metric
+                .push(create_metric_value(&labels, value)),
+            (b"A", Ok(value)) => metrics_collection
+                .health_current
+                .metric
+                .push(create_metric_value(&labels, value)),
+            (b"", _) => {
+                // ignore states
             }
-            SystemHealthType::C => {
-                metrics_collection
-                    .health_temperature
-                    .metric
-                    .push(create_metric_value(&labels, value.value));
+            (field, Ok(value)) => {
+                warn!("Unknown health state: {}={value}", decode_latin1(field));
             }
-            SystemHealthType::V => {
-                metrics_collection
-                    .health_voltage
-                    .metric
-                    .push(create_metric_value(&labels, value.value));
-            }
-            SystemHealthType::Rpm => {
-                metrics_collection
-                    .health_rpm
-                    .metric
-                    .push(create_metric_value(&labels, value.value));
-            }
-            SystemHealthType::A => {
-                metrics_collection
-                    .health_current
-                    .metric
-                    .push(create_metric_value(&labels, value.value));
+            (field, Err(e)) => {
+                warn!("Cannot parse health state: {}:{e}", decode_latin1(field));
             }
         }
     }

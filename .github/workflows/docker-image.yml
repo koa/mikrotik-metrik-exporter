@@ -54,3 +54,8 @@ jobs:
           labels: ${{ steps.meta-x86.outputs.labels }}
           file: Dockerfile
           platforms: linux/amd64
+      - uses: actions/delete-package-versions@v5
+        with:
+          package-name: ${{ env.IMAGE_NAME }}
+          package-type: 'container'
+          min-versions-to-keep: 2

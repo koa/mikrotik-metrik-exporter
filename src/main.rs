@@ -1,4 +1,8 @@
-use axum::{Router, http::StatusCode, routing::get};
+use axum::{
+    Router,
+    http::{StatusCode, header},
+    routing::get,
+};
 use config::{Config, Environment, File};
 use encoding_rs::mem::decode_latin1;
 use env_logger::{Env, TimestampPrecision};
@@ -10,14 +14,14 @@ use mikrotik_model::{
     model::{
         CapsManInterfaceById, CapsManInterfaceState, CapsManRadioState,
         CapsManRegistrationTableState, InterfaceEthernet, InterfaceEthernetPoeMonitorState,
-        InterfaceWifiByName, InterfaceWifiRadioState, InterfaceWifiRegistrationTableState,
-        InterfaceWifiState, IpDhcpServerLease, ResourceType, SystemHealthState, SystemIdentityCfg,
+        InterfaceWifi, InterfaceWifiRadioState, InterfaceWifiRegistrationTableState,
+        IpDhcpServerLease, ResourceType, SystemHealthState, SystemIdentityCfg,
     },
     resource::{DeserializeRosResource, SentenceResult, SingleResource, stream_resource},
     value::{RosValue, StatsPair},
 };
 use prometheus::{
-    Encoder, TextEncoder,
+    Encoder, TEXT_FORMAT, TextEncoder,
     proto::{Counter, LabelPair, Metric, MetricFamily},
 };
 use serde::Deserialize;
@@ -32,7 +36,6 @@ use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct Device {
     #[allow(dead_code)]
     name: Box<str>,
@@ -59,11 +62,11 @@ struct MetricsCollection {
 impl Default for MetricsCollection {
     fn default() -> Self {
         Self {
-            reg_tx_bytes: create_metric("mikrotik_exporter_wlan_registration_tx-bytes"),
-            reg_rx_bytes: create_metric("mikrotik_exporter_wlan_registration_rx-bytes"),
-            reg_tx_packets: create_metric("mikrotik_exporter_wlan_registration_tx-packets"),
-            reg_rx_packets: create_metric("mikrotik_exporter_wlan_registration_rx-packets"),
-            reg_rx_signal: create_metric("mikrotik_exporter_wlan_registration_rx-signal"),
+            reg_tx_bytes: create_metric("mikrotik_exporter_wlan_registration_tx_bytes"),
+            reg_rx_bytes: create_metric("mikrotik_exporter_wlan_registration_rx_bytes"),
+            reg_tx_packets: create_metric("mikrotik_exporter_wlan_registration_tx_packets"),
+            reg_rx_packets: create_metric("mikrotik_exporter_wlan_registration_rx_packets"),
+            reg_rx_signal: create_metric("mikrotik_exporter_wlan_registration_rx_signal"),
             reg_uptime: create_metric("mikrotik_exporter_wlan_registration_uptime"),
             health_temperature: create_metric("mikrotik_exporter_health_temperature"),
             health_voltage: create_metric("mikrotik_exporter_health_voltage"),
@@ -120,16 +123,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .build()?;
 
-    info!("Loaded config: {:?}", cfg);
-    let devs = cfg.get_array("devices").expect("No devices configured");
-    info!("Devices: {:?}", devs);
-    for x in devs {
-        let map = x.into_table().expect("Device is not a table");
-        let address = map.get("address").expect("No address configured");
-        info!("Device address: {}", address);
-        let user = map.get("user").expect("No user configured");
-        info!("Device user: {}", user);
-    }
+    let devices: Vec<Device> = cfg.get("devices")?;
+    debug!("Devices: {:?}", devices);
 
     let port = cfg.get("port").ok().unwrap_or(8080);
     let address = SocketAddr::new(IpAddr::from([0; 8]), port);
@@ -141,11 +136,12 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/metrics",
             get(async move || match metrics(cfg.clone()).await {
-                Ok(metrics) => (StatusCode::OK, metrics),
+                Ok(metrics) => (StatusCode::OK, metrics.0, metrics.1),
                 Err(e) => {
                     error!("Error collecting metrics: {:?}", e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
+                        [(header::CONTENT_TYPE, "text/plain")],
                         format!("{:?}", e).into_bytes(),
                     )
                 }
@@ -176,13 +172,15 @@ async fn main() -> anyhow::Result<()> {
     }
     Ok(())
 }
-async fn metrics(cfg: Config) -> anyhow::Result<Vec<u8>> {
+async fn metrics(
+    cfg: Config,
+) -> anyhow::Result<([(header::HeaderName, &'static str); 1], Vec<u8>)> {
     // Gather the metrics.
     let mut buffer = vec![];
     let encoder = TextEncoder::new();
     let metric_families = collect_metrics(cfg).await?.collect();
     encoder.encode(&metric_families, &mut buffer)?;
-    Ok(buffer)
+    Ok(([(header::CONTENT_TYPE, TEXT_FORMAT)], buffer))
 }
 async fn health() -> &'static str {
     "OK\n"
@@ -190,34 +188,16 @@ async fn health() -> &'static str {
 
 async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
     info!("Starting metrics collection");
-    info!("cfg: {:?}", cfg);
-    //let devices: Vec<Device> = cfg.get("devices")?;
-    let devs = cfg.get_array("devices").expect("No devices configured");
-
+    let devices: Vec<Device> = cfg.get("devices")?;
     //info!("Devices: {:?}", devices);
     let mut metrics_collection = MetricsCollection::default();
-    let mut connected_devices = Vec::with_capacity(devs.len());
-    for device_cfg in devs {
-        let mut device_table = device_cfg.into_table().expect("Device is not a table");
-        let address = device_table
-            .remove("address")
-            .expect("No address configured")
-            .into_string()
-            .expect("Address is not a string");
-        let user = device_table
-            .remove("user")
-            .expect("No user configured")
-            .into_string()
-            .expect("User is not a string");
-        let password = device_table
-            .remove("password")
-            .expect("No password configured")
-            .into_string()
-            .expect("Password is not a string");
+    let mut connected_devices = Vec::with_capacity(devices.len());
+    for device_cfg in devices {
+        let address = device_cfg.address;
         match MikrotikDevice::connect(
-            (address.clone(), 8728),
-            user.as_bytes(),
-            Some(password.as_bytes()),
+            (address, 8728),
+            device_cfg.user.as_bytes(),
+            Some(device_cfg.password.as_bytes()),
         )
         .await
         {
@@ -248,10 +228,9 @@ async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
 }
 
 async fn collect_ip_leases(ip_leases: &mut HashMap<MacAddress, IpLease>, device: &MikrotikDevice) {
-    info!("============== IP Leases ==============");
     let mut lease_stream = stream_resource::<IpDhcpServerLease>(device)
         .await
-        .filter_map(log_problems);
+        .filter_map(log_problems("", "IP Leases"));
     while let Some(lease) = lease_stream.next().await {
         if let Some(mac_address) = lease.status.active_mac_address
             && let Some(hostname) = lease.status.host_name
@@ -272,10 +251,9 @@ async fn collect_ethernet_metric(
     device: &MikrotikDevice,
     identity: &str,
 ) {
-    info!("============== Ethernet ==============");
     let mut ethernet_stream = stream_resource::<InterfaceEthernet>(device)
         .await
-        .filter_map(log_problems);
+        .filter_map(log_problems(identity, "Ethernet"));
     let mut id_list = Vec::<u8>::new();
     let mut poe_count = 0;
     while let Some(value) = ethernet_stream.next().await {
@@ -288,7 +266,6 @@ async fn collect_ethernet_metric(
         }
     }
     if !id_list.is_empty() {
-        info!("============== PoE Monitor ==============");
         let cmd: [&[u8]; _] = [b"/", b"interface/ethernet/poe", b"/monitor"];
 
         let mut stream = device
@@ -304,7 +281,7 @@ async fn collect_ethernet_metric(
             .await
             .take(poe_count)
             .map(|e| e.map(|r| InterfaceEthernetPoeMonitorState::unwrap_resource(r)))
-            .filter_map(log_problems);
+            .filter_map(log_problems(identity, "PoE Monitor"));
         while let Some(value) = stream.next().await {
             if let Some(value) = value {
                 let labels = vec![
@@ -339,10 +316,9 @@ async fn collect_health_metric(
     device: &MikrotikDevice,
     identity: &str,
 ) {
-    info!("============== Health ==============");
     let mut health_value_stream = stream_resource::<SystemHealthState>(device)
         .await
-        .filter_map(log_problems);
+        .filter_map(log_problems(identity, "Health"));
     while let Some(value) = health_value_stream.next().await {
         let labels = vec![
             create_label_pair("hostname", identity.to_string()),
@@ -391,10 +367,9 @@ async fn collect_wifi_metric(
     identity: &str,
     ip_leases: &HashMap<MacAddress, IpLease>,
 ) {
-    info!("============== Wifi Radios ==============");
     let mut radio_stream = stream_resource::<InterfaceWifiRadioState>(&device)
         .await
-        .filter_map(log_problems);
+        .filter_map(log_problems(identity, "Wifi Radios"));
     let mut radios = HashMap::new();
     while let Some(radio) = radio_stream.next().await {
         radios.insert(radio.interface.clone(), radio);
@@ -402,19 +377,16 @@ async fn collect_wifi_metric(
     if radios.is_empty() {
         return;
     }
-    info!("============== Wifi Interfaces ==============");
-    let mut interface_stream =
-        stream_resource::<(InterfaceWifiByName, InterfaceWifiState)>(&device)
-            .await
-            .filter_map(log_problems);
+    let mut interface_stream = stream_resource::<InterfaceWifi>(&device)
+        .await
+        .filter_map(log_problems(identity, "Wifi Interfaces"));
     let mut interfaces = HashMap::new();
-    while let Some((InterfaceWifiByName(cfg), state)) = interface_stream.next().await {
-        interfaces.insert(cfg.name.clone(), (cfg, state));
+    while let Some(InterfaceWifi { cfg, status }) = interface_stream.next().await {
+        interfaces.insert(cfg.name.clone(), (cfg, status));
     }
-    info!("============== Wifi Registrations ==============");
     let mut registration_stream = stream_resource::<InterfaceWifiRegistrationTableState>(&device)
         .await
-        .filter_map(log_problems);
+        .filter_map(log_problems(identity, "Wifi Registrations"));
     while let Some(value) = registration_stream.next().await {
         let if_name = &value.interface;
         let if_data = interfaces.get(if_name);
@@ -452,11 +424,10 @@ async fn collect_capsman_metric(
     identity: &str,
     ip_leases: &HashMap<MacAddress, IpLease>,
 ) {
-    info!("============== Capsman Radio ==============");
     let mut cap_identities_by_radio = HashMap::new();
     let mut radio_stream = stream_resource::<CapsManRadioState>(&device)
         .await
-        .filter_map(log_problems);
+        .filter_map(log_problems(identity, "Capsman Radio"));
     while let Some(radio) = radio_stream.next().await {
         cap_identities_by_radio.insert(radio.interface.clone(), radio);
     }
@@ -464,22 +435,19 @@ async fn collect_capsman_metric(
         return;
     }
     let mut configuration_by_interface = HashMap::new();
-    info!("============== Capsman Interfaces ==============");
     let mut interface_stream =
         stream_resource::<(CapsManInterfaceById, CapsManInterfaceState)>(&device)
             .await
-            .filter_map(log_problems);
+            .filter_map(log_problems(identity, "Capsman Interfaces"));
     while let Some((cfg, state)) = interface_stream.next().await {
         //info!("Found Interface: {:?}, {:?}", cfg,state);
         let cfg = cfg.data;
         configuration_by_interface.insert(cfg.name.clone(), (cfg, state));
     }
 
-    info!("============== Capsman Registrations ==============");
-
     let mut registration_table = stream_resource::<CapsManRegistrationTableState>(&device)
         .await
-        .filter_map(log_problems);
+        .filter_map(log_problems(identity, "Capsman Registrations"));
     while let Some(value) = registration_table.next().await {
         let if_name = &value.interface;
         let if_data = configuration_by_interface.get(if_name);
@@ -603,8 +571,8 @@ fn create_metric(name: &str) -> MetricFamily {
     tx_counter
 }
 
-fn log_problems<E>(entry: SentenceResult<E>) -> Option<E> {
-    match entry {
+fn log_problems<E>(identity: &str, step: &str) -> impl Fn(SentenceResult<E>) -> Option<E> {
+    move |entry| match entry {
         SentenceResult::Row { value, warnings } => {
             warnings.iter().for_each(|w| warn!("Warning: {w}"));
             Some(value)
@@ -613,17 +581,26 @@ fn log_problems<E>(entry: SentenceResult<E>) -> Option<E> {
         SentenceResult::Error { errors, warnings } => {
             warnings.iter().for_each(|w| warn!("Warning: {w}"));
             for error in errors.iter() {
-                error!("Error: {error}");
+                error!("{identity} {step} Error: {error}");
             }
             None
         }
         SentenceResult::Trap { category, message } => {
             if category.is_none() && message.as_ref() == b"no such command prefix" {
-                debug!("Trap: {category:?}: {}", decode_latin1(message.as_ref()));
+                debug!(
+                    "{identity} {step} Trap: {category:?}: {}",
+                    decode_latin1(message.as_ref())
+                );
             } else if let Some(TrapCategory::MissingItemOrCommand) = category {
-                debug!("Trap: {category:?}: {}", decode_latin1(message.as_ref()));
+                debug!(
+                    "{identity} {step} Trap: {category:?}: {}",
+                    decode_latin1(message.as_ref())
+                );
             } else {
-                error!("Trap: {category:?}: {}", decode_latin1(message.as_ref()));
+                error!(
+                    "{identity} {step} Trap: {category:?}: {}",
+                    decode_latin1(message.as_ref())
+                );
             }
             None
         }

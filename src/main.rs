@@ -30,10 +30,11 @@ use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
     process,
+    sync::Arc,
     time::Duration,
 };
-use tokio::net::TcpListener;
-use tokio_stream::StreamExt;
+use tokio::{net::TcpListener, pin, spawn, sync::mpsc::{self, Sender}};
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 #[derive(Debug, Deserialize)]
 struct Device {
@@ -58,6 +59,35 @@ struct MetricsCollection {
     ethernet_poe_out_voltage: MetricFamily,
     ethernet_poe_out_current: MetricFamily,
     ethernet_poe_out_power: MetricFamily,
+}
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum MetricKey {
+    Wlan(WlanKey),
+    Health(HealthKey),
+    Poe(PoeKey),
+}
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum WlanKey {
+    TxBytes,
+    RxBytes,
+    TxPackets,
+    RxPackets,
+    RxSignal,
+    Uptime,
+}
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum HealthKey {
+    Temperature,
+    Voltage,
+    Current,
+    Power,
+    Rpm,
+}
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum PoeKey {
+    Voltage,
+    Current,
+    Power,
 }
 impl Default for MetricsCollection {
     fn default() -> Self {
@@ -189,8 +219,6 @@ async fn health() -> &'static str {
 async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
     info!("Starting metrics collection");
     let devices: Vec<Device> = cfg.get("devices")?;
-    //info!("Devices: {:?}", devices);
-    let mut metrics_collection = MetricsCollection::default();
     let mut connected_devices = Vec::with_capacity(devices.len());
     for device_cfg in devices {
         let address = device_cfg.address;
@@ -210,24 +238,122 @@ async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
         }
     }
 
-    let mut ip_leases = HashMap::<MacAddress, IpLease>::new();
-    for device in connected_devices.iter() {
-        collect_ip_leases(&mut ip_leases, device).await;
+    let (tx, rx) = mpsc::channel(20);
+    for device in connected_devices.iter().cloned() {
+        let sender = tx.clone();
+        spawn(async move {
+            collect_ip_leases(sender, &device).await;
+        });
     }
+    drop(tx);
+    let mut ip_leases = HashMap::new();
+    let stream = ReceiverStream::new(rx).timeout(Duration::from_secs(3));
+    pin!(stream);
+    while let Some(Ok((mac_address, lease))) = stream.next().await {
+        ip_leases.insert(mac_address, lease);
+    }
+    info!("Finished collecting IP Leases: {}", ip_leases.len());
+
+    let (tx, rx) = mpsc::channel(20);
+    let ip_leases = Arc::new(ip_leases);
 
     for device in connected_devices {
-        let identity = SystemIdentityCfg::fetch(&device).await?;
-        let identity = identity.as_ref().map(|i| &i.name).map(<&AsciiString>::into);
-        let identity = identity.as_ref().map(Cow::as_ref).unwrap_or_default();
-        collect_capsman_metric(&mut metrics_collection, &device, identity, &ip_leases).await;
-        collect_wifi_metric(&mut metrics_collection, &device, identity, &ip_leases).await;
-        collect_health_metric(&mut metrics_collection, &device, identity).await;
-        collect_ethernet_metric(&mut metrics_collection, &device, identity).await;
+        let tx = tx.clone();
+        let ip_leases = ip_leases.clone();
+        spawn(async move {
+            let identity = match SystemIdentityCfg::fetch(&device).await {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Error fetching identity for device: {e}");
+                    return;
+                }
+            };
+            let identity = identity.as_ref().map(|i| &i.name).map(<&AsciiString>::into);
+            let identity = identity.as_ref().map(Cow::as_ref).unwrap_or_default();
+            match collect_device_data(&ip_leases, &device, &tx, identity).await {
+                Ok(_) => {}
+                Err(e) => {
+                    error!("Error collecting metrics from device {identity}: {e}");
+                }
+            }
+        });
+    }
+    drop(tx);
+    let stream = ReceiverStream::new(rx).timeout(Duration::from_secs(3));
+    pin!(stream);
+    let mut metrics_collection = MetricsCollection::default();
+    while let Some(Ok((key, metric))) = stream.next().await {
+        match key {
+            MetricKey::Wlan(WlanKey::RxBytes) => {
+                metrics_collection.reg_rx_bytes.metric.push(metric);
+            }
+            MetricKey::Wlan(WlanKey::TxBytes) => {
+                metrics_collection.reg_tx_bytes.metric.push(metric);
+            }
+            MetricKey::Wlan(WlanKey::TxPackets) => {
+                metrics_collection.reg_tx_packets.metric.push(metric);
+            }
+            MetricKey::Wlan(WlanKey::RxPackets) => {
+                metrics_collection.reg_rx_packets.metric.push(metric);
+            }
+            MetricKey::Wlan(WlanKey::RxSignal) => {
+                metrics_collection.reg_rx_signal.metric.push(metric);
+            }
+            MetricKey::Wlan(WlanKey::Uptime) => {
+                metrics_collection.reg_uptime.metric.push(metric);
+            }
+            MetricKey::Health(HealthKey::Temperature) => {
+                metrics_collection.health_temperature.metric.push(metric);
+            }
+            MetricKey::Health(HealthKey::Voltage) => {
+                metrics_collection.health_voltage.metric.push(metric);
+            }
+            MetricKey::Health(HealthKey::Current) => {
+                metrics_collection.health_current.metric.push(metric);
+            }
+            MetricKey::Health(HealthKey::Power) => {
+                metrics_collection.health_power.metric.push(metric);
+            }
+            MetricKey::Health(HealthKey::Rpm) => {
+                metrics_collection.health_rpm.metric.push(metric);
+            }
+            MetricKey::Poe(PoeKey::Current) => {
+                metrics_collection
+                    .ethernet_poe_out_current
+                    .metric
+                    .push(metric);
+            }
+            MetricKey::Poe(PoeKey::Voltage) => {
+                metrics_collection
+                    .ethernet_poe_out_voltage
+                    .metric
+                    .push(metric);
+            }
+            MetricKey::Poe(PoeKey::Power) => {
+                metrics_collection
+                    .ethernet_poe_out_power
+                    .metric
+                    .push(metric);
+            }
+        }
     }
     Ok(metrics_collection)
 }
 
-async fn collect_ip_leases(ip_leases: &mut HashMap<MacAddress, IpLease>, device: &MikrotikDevice) {
+async fn collect_device_data(
+    ip_leases: &HashMap<MacAddress, IpLease>,
+    device: &MikrotikDevice,
+    tx: &Sender<(MetricKey, Metric)>,
+    identity: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    collect_capsman_metric(&tx, &device, identity, &ip_leases).await?;
+    collect_wifi_metric(&tx, &device, identity, &ip_leases).await?;
+    collect_health_metric(&tx, &device, identity).await?;
+    collect_ethernet_metric(&tx, &device, identity).await?;
+    Ok(())
+}
+
+async fn collect_ip_leases(ip_leases: Sender<(MacAddress, IpLease)>, device: &MikrotikDevice) {
     let mut lease_stream = stream_resource::<IpDhcpServerLease>(device)
         .await
         .filter_map(log_problems("", "IP Leases"));
@@ -235,22 +361,25 @@ async fn collect_ip_leases(ip_leases: &mut HashMap<MacAddress, IpLease>, device:
         if let Some(mac_address) = lease.status.active_mac_address
             && let Some(hostname) = lease.status.host_name
         {
-            ip_leases.insert(
-                mac_address,
-                IpLease {
-                    hostname: hostname.to_string().into_boxed_str(),
-                    ip: lease.cfg.address,
-                },
-            );
+            ip_leases
+                .send((
+                    mac_address,
+                    IpLease {
+                        hostname: hostname.to_string().into_boxed_str(),
+                        ip: lease.cfg.address,
+                    },
+                ))
+                .await
+                .unwrap();
         }
     }
 }
 
 async fn collect_ethernet_metric(
-    metrics_collection: &mut MetricsCollection,
+    metrics_collection: &Sender<(MetricKey, Metric)>,
     device: &MikrotikDevice,
     identity: &str,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut ethernet_stream = stream_resource::<InterfaceEthernet>(device)
         .await
         .filter_map(log_problems(identity, "Ethernet"));
@@ -290,32 +419,39 @@ async fn collect_ethernet_metric(
                 ];
                 if let Some(voltage) = value.poe_out_voltage {
                     metrics_collection
-                        .ethernet_poe_out_voltage
-                        .metric
-                        .push(create_metric_value(&labels, voltage));
+                        .send((
+                            MetricKey::Poe(PoeKey::Voltage),
+                            create_metric_value(&labels, voltage),
+                        ))
+                        .await?;
                 }
                 if let Some(current) = value.poe_out_current {
                     metrics_collection
-                        .ethernet_poe_out_current
-                        .metric
-                        .push(create_metric_value(&labels, current));
+                        .send((
+                            MetricKey::Poe(PoeKey::Current),
+                            create_metric_value(&labels, current),
+                        ))
+                        .await?;
                 }
                 if let Some(power) = value.poe_out_power {
                     metrics_collection
-                        .ethernet_poe_out_power
-                        .metric
-                        .push(create_metric_value(&labels, power));
+                        .send((
+                            MetricKey::Poe(PoeKey::Power),
+                            create_metric_value(&labels, power),
+                        ))
+                        .await?;
                 }
             }
         }
     }
+    Ok(())
 }
 
 async fn collect_health_metric(
-    metrics_collection: &mut MetricsCollection,
+    metrics_collection: &Sender<(MetricKey, Metric)>,
     device: &MikrotikDevice,
     identity: &str,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut health_value_stream = stream_resource::<SystemHealthState>(device)
         .await
         .filter_map(log_problems(identity, "Health"));
@@ -328,26 +464,46 @@ async fn collect_health_metric(
             value._type.0.as_ref(),
             value.value.to_string().parse::<f64>(),
         ) {
-            (b"W", Ok(value)) => metrics_collection
-                .health_power
-                .metric
-                .push(create_metric_value(&labels, value)),
-            (b"C", Ok(value)) => metrics_collection
-                .health_temperature
-                .metric
-                .push(create_metric_value(&labels, value)),
-            (b"V", Ok(value)) => metrics_collection
-                .health_voltage
-                .metric
-                .push(create_metric_value(&labels, value)),
-            (b"RPM", Ok(value)) => metrics_collection
-                .health_rpm
-                .metric
-                .push(create_metric_value(&labels, value)),
-            (b"A", Ok(value)) => metrics_collection
-                .health_current
-                .metric
-                .push(create_metric_value(&labels, value)),
+            (b"W", Ok(value)) => {
+                metrics_collection
+                    .send((
+                        MetricKey::Health(HealthKey::Power),
+                        create_metric_value(&labels, value),
+                    ))
+                    .await?
+            }
+            (b"C", Ok(value)) => {
+                metrics_collection
+                    .send((
+                        MetricKey::Health(HealthKey::Temperature),
+                        create_metric_value(&labels, value),
+                    ))
+                    .await?
+            }
+            (b"V", Ok(value)) => {
+                metrics_collection
+                    .send((
+                        MetricKey::Health(HealthKey::Voltage),
+                        create_metric_value(&labels, value),
+                    ))
+                    .await?
+            }
+            (b"RPM", Ok(value)) => {
+                metrics_collection
+                    .send((
+                        MetricKey::Health(HealthKey::Rpm),
+                        create_metric_value(&labels, value),
+                    ))
+                    .await?
+            }
+            (b"A", Ok(value)) => {
+                metrics_collection
+                    .send((
+                        MetricKey::Health(HealthKey::Current),
+                        create_metric_value(&labels, value),
+                    ))
+                    .await?
+            }
             (b"", _) => {
                 // ignore states
             }
@@ -359,14 +515,15 @@ async fn collect_health_metric(
             }
         }
     }
+    Ok(())
 }
 
 async fn collect_wifi_metric(
-    metrics_collection: &mut MetricsCollection,
+    metrics_collection: &Sender<(MetricKey, Metric)>,
     device: &MikrotikDevice,
     identity: &str,
     ip_leases: &HashMap<MacAddress, IpLease>,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut radio_stream = stream_resource::<InterfaceWifiRadioState>(&device)
         .await
         .filter_map(log_problems(identity, "Wifi Radios"));
@@ -375,7 +532,7 @@ async fn collect_wifi_metric(
         radios.insert(radio.interface.clone(), radio);
     }
     if radios.is_empty() {
-        return;
+        return Ok(());
     }
     let mut interface_stream = stream_resource::<InterfaceWifi>(&device)
         .await
@@ -414,16 +571,18 @@ async fn collect_wifi_metric(
             value.packets,
             value.signal,
             value.uptime,
-        );
+        )
+        .await?;
     }
+    Ok(())
 }
 
 async fn collect_capsman_metric(
-    metrics_collection: &mut MetricsCollection,
+    sender: &Sender<(MetricKey, Metric)>,
     device: &MikrotikDevice,
     identity: &str,
     ip_leases: &HashMap<MacAddress, IpLease>,
-) {
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut cap_identities_by_radio = HashMap::new();
     let mut radio_stream = stream_resource::<CapsManRadioState>(&device)
         .await
@@ -432,7 +591,7 @@ async fn collect_capsman_metric(
         cap_identities_by_radio.insert(radio.interface.clone(), radio);
     }
     if cap_identities_by_radio.is_empty() {
-        return;
+        return Ok(());
     }
     let mut configuration_by_interface = HashMap::new();
     let mut interface_stream =
@@ -472,48 +631,63 @@ async fn collect_capsman_metric(
             ip_leases,
         );
         write_caps_metrics(
-            metrics_collection,
+            sender,
             label,
             value.bytes,
             value.packets,
             value.rx_signal,
             value.uptime,
-        );
+        )
+        .await?;
     }
+    Ok(())
 }
 
-fn write_caps_metrics(
-    metrics_collection: &mut MetricsCollection,
+async fn write_caps_metrics(
+    sender: &Sender<(MetricKey, Metric)>,
     label: Vec<LabelPair>,
     bytes_pair: StatsPair<u64>,
     packets_pair: StatsPair<u64>,
     signal: i16,
     uptime: Duration,
-) {
-    metrics_collection
-        .reg_tx_bytes
-        .metric
-        .push(create_metric_value(&label, bytes_pair.tx as f64));
-    metrics_collection
-        .reg_rx_bytes
-        .metric
-        .push(create_metric_value(&label, bytes_pair.rx as f64));
-    metrics_collection
-        .reg_tx_packets
-        .metric
-        .push(create_metric_value(&label, packets_pair.tx as f64));
-    metrics_collection
-        .reg_rx_packets
-        .metric
-        .push(create_metric_value(&label, packets_pair.rx as f64));
-    metrics_collection
-        .reg_rx_signal
-        .metric
-        .push(create_metric_value(&label, signal as f64));
-    metrics_collection
-        .reg_uptime
-        .metric
-        .push(create_metric_value(&label, uptime.as_secs_f64()));
+) -> Result<(), Box<dyn std::error::Error>> {
+    sender
+        .send((
+            MetricKey::Wlan(WlanKey::TxBytes),
+            create_metric_value(&label, bytes_pair.tx as f64),
+        ))
+        .await?;
+    sender
+        .send((
+            MetricKey::Wlan(WlanKey::RxBytes),
+            create_metric_value(&label, bytes_pair.rx as f64),
+        ))
+        .await?;
+    sender
+        .send((
+            MetricKey::Wlan(WlanKey::RxSignal),
+            create_metric_value(&label, signal as f64),
+        ))
+        .await?;
+    sender
+        .send((
+            MetricKey::Wlan(WlanKey::RxPackets),
+            create_metric_value(&label, packets_pair.rx as f64),
+        ))
+        .await?;
+    sender
+        .send((
+            MetricKey::Wlan(WlanKey::TxPackets),
+            create_metric_value(&label, packets_pair.tx as f64),
+        ))
+        .await?;
+    sender
+        .send((
+            MetricKey::Wlan(WlanKey::Uptime),
+            create_metric_value(&label, uptime.as_secs_f64()),
+        ))
+        .await?;
+    Ok(())
 }
 
 fn create_metric_value(label: &Vec<LabelPair>, x: f64) -> Metric {

@@ -13,12 +13,12 @@ use mikrotik_model::{
     ascii::AsciiString,
     model::{
         CapsManInterfaceById, CapsManInterfaceState, CapsManRadioState,
-        CapsManRegistrationTableState, InterfaceEthernet, InterfaceEthernetPoeMonitorState,
+        CapsManRegistrationTableState, InterfaceEthernet, InterfaceEthernetPoeMonitor,
         InterfaceWifi, InterfaceWifiRadioState, InterfaceWifiRegistrationTableState,
-        IpDhcpServerLease, ResourceType, SystemHealthState, SystemIdentityCfg,
+        IpDhcpServerLease, SystemHealthState, SystemIdentityCfg,
     },
-    resource::{DeserializeRosResource, SentenceResult, SingleResource, stream_resource},
-    value::{RosValue, StatsPair},
+    resource::{SentenceResult, SingleResource, monitor_once_resource, stream_resource},
+    value::StatsPair,
 };
 use prometheus::{
     Encoder, TEXT_FORMAT, TextEncoder,
@@ -33,7 +33,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{net::TcpListener, pin, spawn, sync::mpsc::{self, Sender}};
+use tokio::{
+    net::TcpListener,
+    pin, spawn,
+    sync::mpsc::{self, Sender},
+};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 #[derive(Debug, Deserialize)]
@@ -380,68 +384,45 @@ async fn collect_ethernet_metric(
     device: &MikrotikDevice,
     identity: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut ethernet_stream = stream_resource::<InterfaceEthernet>(device)
+    let ethernet_stream = stream_resource::<InterfaceEthernet>(device)
         .await
         .filter_map(log_problems(identity, "Ethernet"));
-    let mut id_list = Vec::<u8>::new();
-    let mut poe_count = 0;
-    while let Some(value) = ethernet_stream.next().await {
-        if value.cfg.poe_out.is_some() {
-            if !id_list.is_empty() {
-                id_list.extend(b",");
-            }
-            id_list.extend(value.status.id.encode_ros().as_ref());
-            poe_count += 1;
+    let ids = ethernet_stream
+        .filter(|e| e.cfg.poe_out.is_some())
+        .map(|e| e.status.id)
+        .collect::<Vec<_>>()
+        .await;
+    let mut stream = monitor_once_resource::<InterfaceEthernetPoeMonitor>(ids.into_iter(), device)
+        .await
+        .filter_map(log_problems(identity, "PoE Monitor"));
+    while let Some(value) = stream.next().await {
+        let labels = vec![
+            create_label_pair("hostname", identity.to_string()),
+            create_label_pair("interface", value.name.to_string()),
+        ];
+        if let Some(voltage) = value.poe_out_voltage {
+            metrics_collection
+                .send((
+                    MetricKey::Poe(PoeKey::Voltage),
+                    create_metric_value(&labels, voltage),
+                ))
+                .await?;
         }
-    }
-    if !id_list.is_empty() {
-        let cmd: [&[u8]; _] = [b"/", b"interface/ethernet/poe", b"/monitor"];
-
-        let mut stream = device
-            .send_command(
-                &cmd,
-                |cb| {
-                    cb.attribute(b".id", id_list.as_slice())
-                        .attribute(b"duration", b"0.5")
-                        .attribute(b"interval", b"0.5")
-                },
-                ResourceType::InterfaceEthernetPoeMonitorState,
-            )
-            .await
-            .take(poe_count)
-            .map(|e| e.map(|r| InterfaceEthernetPoeMonitorState::unwrap_resource(r)))
-            .filter_map(log_problems(identity, "PoE Monitor"));
-        while let Some(value) = stream.next().await {
-            if let Some(value) = value {
-                let labels = vec![
-                    create_label_pair("hostname", identity.to_string()),
-                    create_label_pair("interface", value.name.to_string()),
-                ];
-                if let Some(voltage) = value.poe_out_voltage {
-                    metrics_collection
-                        .send((
-                            MetricKey::Poe(PoeKey::Voltage),
-                            create_metric_value(&labels, voltage),
-                        ))
-                        .await?;
-                }
-                if let Some(current) = value.poe_out_current {
-                    metrics_collection
-                        .send((
-                            MetricKey::Poe(PoeKey::Current),
-                            create_metric_value(&labels, current),
-                        ))
-                        .await?;
-                }
-                if let Some(power) = value.poe_out_power {
-                    metrics_collection
-                        .send((
-                            MetricKey::Poe(PoeKey::Power),
-                            create_metric_value(&labels, power),
-                        ))
-                        .await?;
-                }
-            }
+        if let Some(current) = value.poe_out_current {
+            metrics_collection
+                .send((
+                    MetricKey::Poe(PoeKey::Current),
+                    create_metric_value(&labels, current),
+                ))
+                .await?;
+        }
+        if let Some(power) = value.poe_out_power {
+            metrics_collection
+                .send((
+                    MetricKey::Poe(PoeKey::Power),
+                    create_metric_value(&labels, power),
+                ))
+                .await?;
         }
     }
     Ok(())

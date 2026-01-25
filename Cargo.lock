@@ -520,6 +520,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f29059c0c2090612e8d742178b0580d2dc940c837851ad723096f87af6663e"
 
 [[package]]
+name = "futures-sink"
+version = "0.3.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e575fab7d1e0dcb8d0c7bcf9a63ee213816ab51902e6d244a95819acacf1d4f7"
+
+[[package]]
 name = "futures-task"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -872,7 +878,7 @@ dependencies = [
 [[package]]
 name = "mikrotik-model"
 version = "0.1.0"
-source = "git+https://github.com/koa/mikrotik-model#ab0e878cddbb61248f5da9a7e0f2f8ff743b2a07"
+source = "git+https://github.com/koa/mikrotik-model#14397ae4277ace26f504e762328bac481da99d5d"
 dependencies = [
  "config 0.14.1",
  "const-str",
@@ -892,12 +898,13 @@ dependencies = [
  "serde",
  "thiserror 2.0.17",
  "tokio-stream",
+ "tokio-util",
 ]
 
 [[package]]
 name = "mikrotik-model-generator"
 version = "0.1.0"
-source = "git+https://github.com/koa/mikrotik-model#ab0e878cddbb61248f5da9a7e0f2f8ff743b2a07"
+source = "git+https://github.com/koa/mikrotik-model#14397ae4277ace26f504e762328bac481da99d5d"
 dependencies = [
  "convert_case",
  "darling",
@@ -914,7 +921,7 @@ dependencies = [
 [[package]]
 name = "mikrotik-model-generator-macro"
 version = "0.1.0"
-source = "git+https://github.com/koa/mikrotik-model#ab0e878cddbb61248f5da9a7e0f2f8ff743b2a07"
+source = "git+https://github.com/koa/mikrotik-model#14397ae4277ace26f504e762328bac481da99d5d"
 dependencies = [
  "darling",
  "mikrotik-model-generator",
@@ -1506,6 +1513,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
 dependencies = [
  "futures-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
  "pin-project-lite",
  "tokio",
 ]

@@ -847,7 +847,7 @@ dependencies = [
 [[package]]
 name = "mikrotik-api"
 version = "0.1.0"
-source = "git+https://github.com/koa/mikrotik-api#3707b83272102f9b7ab0af4bb6be034c58c810c5"
+source = "git+https://github.com/koa/mikrotik-api#eab1c48088a49e407c59f65a7482460a7e716873"
 dependencies = [
  "encoding_rs",
  "log",
@@ -866,7 +866,6 @@ dependencies = [
  "encoding_rs",
  "env_logger",
  "log",
- "mikrotik-api",
  "mikrotik-model",
  "prometheus",
  "protobuf",
@@ -878,7 +877,7 @@ dependencies = [
 [[package]]
 name = "mikrotik-model"
 version = "0.1.0"
-source = "git+https://github.com/koa/mikrotik-model#14397ae4277ace26f504e762328bac481da99d5d"
+source = "git+https://github.com/koa/mikrotik-model#600c937e32478094d8734a0ff3e7d858c62a48e9"
 dependencies = [
  "config 0.14.1",
  "const-str",
@@ -904,7 +903,7 @@ dependencies = [
 [[package]]
 name = "mikrotik-model-generator"
 version = "0.1.0"
-source = "git+https://github.com/koa/mikrotik-model#14397ae4277ace26f504e762328bac481da99d5d"
+source = "git+https://github.com/koa/mikrotik-model#600c937e32478094d8734a0ff3e7d858c62a48e9"
 dependencies = [
  "convert_case",
  "darling",
@@ -921,7 +920,7 @@ dependencies = [
 [[package]]
 name = "mikrotik-model-generator-macro"
 version = "0.1.0"
-source = "git+https://github.com/koa/mikrotik-model#14397ae4277ace26f504e762328bac481da99d5d"
+source = "git+https://github.com/koa/mikrotik-model#600c937e32478094d8734a0ff3e7d858c62a48e9"
 dependencies = [
  "darling",
  "mikrotik-model-generator",

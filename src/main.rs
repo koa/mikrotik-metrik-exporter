@@ -7,10 +7,10 @@ use config::{Config, Environment, File};
 use encoding_rs::mem::decode_latin1;
 use env_logger::{Env, TimestampPrecision};
 use log::{debug, error, info, warn};
-use mikrotik_api::prelude::TrapCategory;
 use mikrotik_model::{
     MacAddress, MikrotikDevice,
     ascii::AsciiString,
+    mikrotik_api::TrapCategory,
     model::{
         CapsManInterfaceById, CapsManInterfaceState, CapsManRadioState,
         CapsManRegistrationTableState, InterfaceEthernet, InterfaceEthernetPoeMonitor,
@@ -29,6 +29,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     net::{IpAddr, SocketAddr},
+    ops::Add,
     process,
     sync::Arc,
     time::Duration,
@@ -37,6 +38,7 @@ use tokio::{
     net::TcpListener,
     pin, spawn,
     sync::mpsc::{self, Sender},
+    time::{Instant, timeout_at},
 };
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
@@ -220,8 +222,11 @@ async fn health() -> &'static str {
     "OK\n"
 }
 
+const DHCP_TIMEOUT: Duration = Duration::from_secs(2);
+const COLLECT_TIMEOUT: Duration = Duration::from_secs(8 + 2);
+
 async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
-    info!("Starting metrics collection");
+    let start_time = Instant::now();
     let devices: Vec<Device> = cfg.get("devices")?;
     let mut connected_devices = Vec::with_capacity(devices.len());
     for device_cfg in devices {
@@ -234,7 +239,7 @@ async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
         .await
         {
             Ok(device) => {
-                connected_devices.push(device);
+                connected_devices.push((device, device_cfg.name.clone()));
             }
             Err(error) => {
                 error!("Cannot connect to device: {address}, {error}");
@@ -243,17 +248,27 @@ async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
     }
 
     let (tx, rx) = mpsc::channel(20);
-    for device in connected_devices.iter().cloned() {
+    for (device, name) in connected_devices.iter().cloned() {
         let sender = tx.clone();
         spawn(async move {
-            collect_ip_leases(sender, &device).await;
+            match timeout_at(
+                start_time.add(DHCP_TIMEOUT),
+                collect_ip_leases(sender, &device),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(_) => {
+                    error!("Timeout collecting IP Leases from device {name}");
+                }
+            }
         });
     }
     drop(tx);
-    let mut ip_leases = HashMap::new();
-    let stream = ReceiverStream::new(rx).timeout(Duration::from_secs(3));
+    let stream = ReceiverStream::new(rx);
     pin!(stream);
-    while let Some(Ok((mac_address, lease))) = stream.next().await {
+    let mut ip_leases = HashMap::new();
+    while let Some((mac_address, lease)) = stream.next().await {
         ip_leases.insert(mac_address, lease);
     }
     info!("Finished collecting IP Leases: {}", ip_leases.len());
@@ -261,32 +276,30 @@ async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
     let (tx, rx) = mpsc::channel(20);
     let ip_leases = Arc::new(ip_leases);
 
-    for device in connected_devices {
+    for (device, name) in connected_devices {
         let tx = tx.clone();
         let ip_leases = ip_leases.clone();
         spawn(async move {
-            let identity = match SystemIdentityCfg::fetch(&device).await {
-                Ok(id) => id,
-                Err(e) => {
-                    error!("Error fetching identity for device: {e}");
-                    return;
-                }
-            };
-            let identity = identity.as_ref().map(|i| &i.name).map(<&AsciiString>::into);
-            let identity = identity.as_ref().map(Cow::as_ref).unwrap_or_default();
-            match collect_device_data(&ip_leases, &device, &tx, identity).await {
+            match timeout_at(
+                start_time.add(COLLECT_TIMEOUT),
+                process_device_metrics(&device, &tx, &ip_leases),
+            )
+            .await
+            {
                 Ok(_) => {}
-                Err(e) => {
-                    error!("Error collecting metrics from device {identity}: {e}");
+                Err(_) => {
+                    error!("Timeout collecting Metrics from device {name}");
                 }
             }
         });
     }
     drop(tx);
-    let stream = ReceiverStream::new(rx).timeout(Duration::from_secs(3));
+    let stream = ReceiverStream::new(rx)
+        .map(Some)
+        .merge(send_at(start_time.add(COLLECT_TIMEOUT)).map(|_| None));
     pin!(stream);
     let mut metrics_collection = MetricsCollection::default();
-    while let Some(Ok((key, metric))) = stream.next().await {
+    while let Some(Some((key, metric))) = stream.next().await {
         match key {
             MetricKey::Wlan(WlanKey::RxBytes) => {
                 metrics_collection.reg_rx_bytes.metric.push(metric);
@@ -342,6 +355,40 @@ async fn collect_metrics(cfg: Config) -> anyhow::Result<MetricsCollection> {
         }
     }
     Ok(metrics_collection)
+}
+
+async fn process_device_metrics(
+    device: &MikrotikDevice,
+    result_sender: &Sender<(MetricKey, Metric)>,
+    ip_leases: &Arc<HashMap<MacAddress, IpLease>>,
+) {
+    let identity= match SystemIdentityCfg::fetch(&device).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Error fetching identity for device: {e}");
+            return;
+        }
+    };
+    let identity = identity.as_ref().map(|i| &i.name).map(<&AsciiString>::into);
+    let identity = identity.as_ref().map(Cow::as_ref).unwrap_or_default();
+    match collect_device_data(&ip_leases, &device, &result_sender, identity).await {
+        Ok(_) => {}
+        Err(e) => {
+            error!("Error collecting metrics from device {identity}: {e}");
+        }
+    }
+}
+
+fn send_at(deadline: Instant) -> ReceiverStream<()> {
+    let (tx, rx) = mpsc::channel::<()>(1);
+    spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        match tx.send(()).await {
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    });
+    ReceiverStream::new(rx)
 }
 
 async fn collect_device_data(
